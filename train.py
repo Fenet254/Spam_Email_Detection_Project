@@ -3,6 +3,7 @@ import string
 import joblib
 import pandas as pd
 
+import nltk
 from nltk.corpus import stopwords
 from nltk.stem import WordNetLemmatizer
 
@@ -17,6 +18,25 @@ from sklearn.metrics import (
 )
 
 DATA_PATH = "data/spam.csv"
+
+
+def ensure_nltk_data():
+    """Download required NLTK corpora if they aren't already present.
+    Needed because fresh deploy environments (Render, Streamlit Cloud, etc.)
+    don't carry over anything downloaded locally."""
+    required = {
+        "stopwords": "corpora/stopwords",
+        "wordnet": "corpora/wordnet",
+        "omw-1.4": "corpora/omw-1.4",
+    }
+    for pkg, resource_path in required.items():
+        try:
+            nltk.data.find(resource_path)
+        except LookupError:
+            nltk.download(pkg, quiet=True)
+
+
+ensure_nltk_data()
 
 STOPWORDS = set(stopwords.words("english"))
 LEMMATIZER = WordNetLemmatizer()

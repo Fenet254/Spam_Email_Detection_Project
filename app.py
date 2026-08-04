@@ -9,6 +9,7 @@ app = Flask(__name__)
 MODEL = joblib.load("models/spam_model.pkl")
 VECTORIZER = joblib.load("models/vectorizer.pkl")
 
+# ... (PAGE template and routes exactly as you had them — no changes needed)
 PAGE = """
 <!doctype html>
 <html lang="en">
