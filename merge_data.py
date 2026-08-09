@@ -1,50 +1,60 @@
 import pandas as pd
-import re
 
-# --- load your existing project dataset (label,text) ---
-existing = pd.read_csv('data/spam.csv', encoding='latin-1', header=None, names=['label', 'text'])
 
-# drop a stray header row if spam.csv already has one at the top
-existing = existing[~existing['label'].str.lower().isin(['label', 'v1'])]
+def build_merged_dataset(
+    spam_csv_path="data/spam.csv",
+    emails_csv_path="data/emails.csv",
+    output_path="data/dataset.csv",
+):
+    """
+    Loads spam.csv and emails.csv, standardizes both to a common
+    ['label', 'text'] format (label = 'ham'/'spam'), merges them,
+    and SAVES the result to output_path as the single source-of-truth
+    dataset for the rest of the pipeline.
+    """
+    # --- Load spam.csv (columns: v1=label, v2=text) ---
+    df1 = pd.read_csv(spam_csv_path, encoding="latin-1")
+    df1 = df1[["v1", "v2"]].rename(columns={"v1": "label", "v2": "text"})
+    df1["label"] = df1["label"].str.strip().str.lower()
 
-# --- load the second dataset ---
-second = pd.read_csv('data/emails.csv', sep=None, engine='python', header=None)
+    # --- Load emails.csv (columns: text, spam=1/0) ---
+    df2 = pd.read_csv(emails_csv_path)
+    df2 = df2[["text", "spam"]].rename(columns={"spam": "label"})
+    df2["label"] = df2["label"].map({1: "spam", 0: "ham"})
+    # strip the leading "Subject:" that appears on every row, so the text
+    # format matches spam.csv (which has no such prefix)
+    df2["text"] = df2["text"].str.replace(r"(?i)^\s*subject\s*:\s*", "", regex=True)
 
-# drop fully empty trailing columns (handles the extra trailing tab you pasted)
-second = second.dropna(axis=1, how='all')
+    # --- Merge ---
+    merged = pd.concat([df1[["label", "text"]], df2[["label", "text"]]], ignore_index=True)
 
-# find the 0/1 label column and the text column automatically
-label_col = None
-for c in second.columns:
-    vals = pd.to_numeric(second[c], errors='coerce').dropna().unique()
-    if set(vals).issubset({0, 1}) and len(vals) > 0:
-        label_col = c
-        break
+    # basic cleanup
+    merged["text"] = merged["text"].astype(str).str.strip()
+    merged = merged.dropna(subset=["label", "text"])
+    merged = merged[merged["text"] != ""]
 
-text_col = [c for c in second.columns if c != label_col][0]
+    # drop exact duplicate rows (same label + text)
+    before = len(merged)
+    merged = merged.drop_duplicates(subset=["label", "text"]).reset_index(drop=True)
+    removed = before - len(merged)
 
-second = second.rename(columns={text_col: 'text', label_col: 'raw_label'})
-second['raw_label'] = pd.to_numeric(second['raw_label'], errors='coerce')
-second = second.dropna(subset=['raw_label'])
+    print(f"spam.csv:   {len(df1)} rows")
+    print(f"emails.csv: {len(df2)} rows")
+    print(f"Merged (pre-dedup): {before} rows")
+    print(f"Removed {removed} duplicate rows")
+    print(f"Final merged dataset: {len(merged)} rows")
+    print(merged["label"].value_counts())
 
-# --- strip the leading "Subject:" from every message ---
-second['text'] = second['text'].astype(str).str.replace(
-    r'^\s*Subject\s*:\s*', '', regex=True, flags=re.IGNORECASE
-).str.strip()
+    merged.to_csv(output_path, index=False)
+    print(f"Saved merged dataset to {output_path}")
 
-# --- all spam rows ---
-spam_rows = second[second['raw_label'] == 1].copy()
-spam_rows['label'] = 'spam'
+    return merged
 
-# --- 200 random ham rows ---
-ham_rows = second[second['raw_label'] == 0].sample(n=200, random_state=42).copy()
-ham_rows['label'] = 'ham'
 
-to_add = pd.concat([spam_rows, ham_rows])[['label', 'text']]
+def load_dataset(path="data/dataset.csv"):
+    """Loads the final merged dataset (run build_merged_dataset() once first)."""
+    return pd.read_csv(path)
 
-# --- append to the existing project dataset and save ---
-combined = pd.concat([existing, to_add], ignore_index=True)
-combined.to_csv('data/spam.csv', index=False, header=False, encoding='latin-1')
 
-print(f"Added {len(spam_rows)} spam rows and {len(ham_rows)} ham rows.")
-print(f"New total in data/spam.csv: {len(combined)} rows.")
+if __name__ == "__main__":
+    build_merged_dataset()

@@ -1,11 +1,14 @@
+"""
+Spam Email Detection - Full Training Pipeline
+Merges data/train/spam.csv + data/test/emails.csv, trains, and saves model.
+"""
+
+import pandas as pd
+import numpy as np
 import re
 import string
-import joblib
-import pandas as pd
-
-import nltk
-from nltk.corpus import stopwords
-from nltk.stem import WordNetLemmatizer
+import pickle
+import os
 
 from sklearn.model_selection import train_test_split
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -17,130 +20,183 @@ from sklearn.metrics import (
     f1_score, confusion_matrix, classification_report
 )
 
-DATA_PATH = "data/spam.csv"
+import nltk
+from nltk.corpus import stopwords
+
+# ---------------------------------------------------------------------------
+# Setup: download NLTK stopwords if missing
+# ---------------------------------------------------------------------------
+try:
+    stop_words = set(stopwords.words('english'))
+except LookupError:
+    nltk.download('stopwords')
+    stop_words = set(stopwords.words('english'))
 
 
-def ensure_nltk_data():
-    """Download required NLTK corpora if they aren't already present.
-    Needed because fresh deploy environments (Render, Streamlit Cloud, etc.)
-    don't carry over anything downloaded locally."""
-    required = {
-        "stopwords": "corpora/stopwords",
-        "wordnet": "corpora/wordnet",
-        "omw-1.4": "corpora/omw-1.4",
-    }
-    for pkg, resource_path in required.items():
-        try:
-            nltk.data.find(resource_path)
-        except LookupError:
-            nltk.download(pkg, quiet=True)
+# ---------------------------------------------------------------------------
+# STEP 1 & 2: Load and standardize both datasets
+# ---------------------------------------------------------------------------
+def load_and_standardize(path):
+    """
+    Loads a CSV and standardizes it to two columns: 'label', 'text'.
+    Handles common spam-dataset formats automatically.
+    """
+    # try a couple encodings — SMS spam collection is often latin-1
+    try:
+        df = pd.read_csv(path, encoding='utf-8')
+    except UnicodeDecodeError:
+        df = pd.read_csv(path, encoding='latin-1')
 
+    df.columns = [c.strip().lower() for c in df.columns]
 
-ensure_nltk_data()
+    # Map of possible column name variants -> standard name
+    label_candidates = ['label', 'category', 'v1', 'class', 'spam']
+    text_candidates = ['text', 'message', 'v2', 'email', 'body', 'content']
 
-STOPWORDS = set(stopwords.words("english"))
-LEMMATIZER = WordNetLemmatizer()
+    label_col = next((c for c in label_candidates if c in df.columns), None)
+    text_col = next((c for c in text_candidates if c in df.columns), None)
 
+    if label_col is None or text_col is None:
+        raise ValueError(
+            f"Could not auto-detect label/text columns in {path}. "
+            f"Found columns: {list(df.columns)}. "
+            f"Please rename manually to 'label' and 'text'."
+        )
 
-def load_dataset(path=DATA_PATH):
-    df = pd.read_csv(path, encoding="latin-1")
-    df = df[["v1", "v2"]].rename(columns={"v1": "label", "v2": "message"})
-    print(f"Loaded {len(df)} rows from {path}")
+    df = df[[label_col, text_col]].copy()
+    df.columns = ['label', 'text']
+
+    # Standardize label values -> 'spam' / 'ham'
+    df['label'] = df['label'].astype(str).str.strip().str.lower()
+    df['label'] = df['label'].replace({
+        '1': 'spam', '0': 'ham',
+        'true': 'spam', 'false': 'ham',
+        'yes': 'spam', 'no': 'ham'
+    })
+
     return df
 
 
-def explore_data(df):
-    print(df["label"].value_counts())
-    print(df.isnull().sum())
-    df = df.drop_duplicates().reset_index(drop=True)
-    print(f"Shape after dedup: {df.shape}")
-    return df
+DATA_DIR = 'data'
+TRAIN_PATH = os.path.join(DATA_DIR, 'train', 'spam.csv')
+TEST_PATH = os.path.join(DATA_DIR, 'test', 'emails.csv')
+
+print("Loading datasets...")
+df1 = load_and_standardize(TRAIN_PATH)
+df2 = load_and_standardize(TEST_PATH)
+
+print(f"  spam.csv:   {df1.shape[0]} rows")
+print(f"  emails.csv: {df2.shape[0]} rows")
+
+# ---------------------------------------------------------------------------
+# Merge the two datasets into one
+# ---------------------------------------------------------------------------
+df = pd.concat([df1, df2], ignore_index=True)
+print(f"Merged dataset: {df.shape[0]} rows")
 
 
+# ---------------------------------------------------------------------------
+# STEP 3: Explore the Data (EDA)
+# ---------------------------------------------------------------------------
+print("\n--- EDA ---")
+print("Label distribution:\n", df['label'].value_counts())
+print("Missing values:\n", df.isnull().sum())
+
+df = df.dropna(subset=['text', 'label'])
+df = df[df['label'].isin(['spam', 'ham'])]  # drop any unrecognized labels
+
+before = len(df)
+df = df.drop_duplicates(subset=['text'])
+print(f"Removed {before - len(df)} duplicate rows")
+
+print("Final label distribution:\n", df['label'].value_counts())
+
+
+# ---------------------------------------------------------------------------
+# STEP 4: Preprocess the Text
+# ---------------------------------------------------------------------------
 def clean_text(text):
-    text = text.lower()
-    text = re.sub(f"[{re.escape(string.punctuation)}]", " ", text)
-    text = re.sub(r"\d+", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-
+    text = str(text).lower()
+    text = re.sub(r'http\S+|www\S+', '', text)          # remove URLs
+    text = re.sub(r'\d+', '', text)                      # remove numbers
+    text = text.translate(str.maketrans('', '', string.punctuation))  # punctuation
     tokens = text.split()
-    tokens = [LEMMATIZER.lemmatize(t) for t in tokens if t not in STOPWORDS and len(t) > 1]
-    return " ".join(tokens)
+    tokens = [w for w in tokens if w not in stop_words]  # stopwords
+    return ' '.join(tokens)
 
 
-def preprocess_dataframe(df):
-    df["clean_message"] = df["message"].apply(clean_text)
-    return df
+print("\nCleaning text...")
+df['clean_text'] = df['text'].apply(clean_text)
+df = df[df['clean_text'].str.strip() != '']  # drop empty after cleaning
 
 
-def build_features(df):
-    vectorizer = TfidfVectorizer(max_features=3000, ngram_range=(1, 2))
-    X = vectorizer.fit_transform(df["clean_message"])
-    y = df["label"].map({"ham": 0, "spam": 1})
-    return X, y, vectorizer
+# ---------------------------------------------------------------------------
+# STEP 5: Convert Text into Numerical Features (TF-IDF)
+# ---------------------------------------------------------------------------
+X = df['clean_text']
+y = df['label'].map({'ham': 0, 'spam': 1})
+
+vectorizer = TfidfVectorizer(max_features=5000, ngram_range=(1, 2))
+X_vec = vectorizer.fit_transform(X)
 
 
-def split_data(X, y):
-    return train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+# ---------------------------------------------------------------------------
+# STEP 6: Split the Dataset
+# ---------------------------------------------------------------------------
+X_train, X_test, y_train, y_test = train_test_split(
+    X_vec, y, test_size=0.2, random_state=42, stratify=y
+)
 
 
-def train_models(X_train, y_train):
-    models = {
-        "Multinomial Naive Bayes": MultinomialNB(),
-        "Logistic Regression": LogisticRegression(max_iter=1000),
-        "Linear SVM": LinearSVC(),
-    }
-    for model in models.values():
-        model.fit(X_train, y_train)
-    return models
+# ---------------------------------------------------------------------------
+# STEP 7: Train the Model
+# ---------------------------------------------------------------------------
+print("\nTraining model...")
+model = MultinomialNB()
+model.fit(X_train, y_train)
+
+# Alternatives you can swap in:
+# model = LogisticRegression(max_iter=1000)
+# model = LinearSVC()
 
 
-def evaluate_models(models, X_test, y_test):
-    results = {}
-    for name, model in models.items():
-        y_pred = model.predict(X_test)
-        acc = accuracy_score(y_test, y_pred)
-        prec = precision_score(y_test, y_pred)
-        rec = recall_score(y_test, y_pred)
-        f1 = f1_score(y_test, y_pred)
-        cm = confusion_matrix(y_test, y_pred)
+# ---------------------------------------------------------------------------
+# STEP 8: Evaluate the Model
+# ---------------------------------------------------------------------------
+y_pred = model.predict(X_test)
 
-        results[name] = {"accuracy": acc, "precision": prec, "recall": rec, "f1": f1, "model": model}
-
-        print(f"\n{name}")
-        print(f"Accuracy: {acc:.4f}  Precision: {prec:.4f}  Recall: {rec:.4f}  F1: {f1:.4f}")
-        print(cm)
-        print(classification_report(y_test, y_pred, target_names=["ham", "spam"]))
-
-    return results
+print("\n--- Evaluation ---")
+print("Accuracy: ", accuracy_score(y_test, y_pred))
+print("Precision:", precision_score(y_test, y_pred))
+print("Recall:   ", recall_score(y_test, y_pred))
+print("F1-Score: ", f1_score(y_test, y_pred))
+print("\nConfusion Matrix:\n", confusion_matrix(y_test, y_pred))
+print("\nClassification Report:\n", classification_report(y_test, y_pred))
 
 
-def predict_message(model, vectorizer, message):
-    cleaned = clean_text(message)
+# ---------------------------------------------------------------------------
+# STEP 9: Predict New Messages (example)
+# ---------------------------------------------------------------------------
+def predict_message(msg):
+    cleaned = clean_text(msg)
     vec = vectorizer.transform([cleaned])
     pred = model.predict(vec)[0]
-    return "Spam" if pred == 1 else "Ham"
+    return 'spam' if pred == 1 else 'ham'
 
 
-def main():
-    df = load_dataset()
-    df = explore_data(df)
-    df = preprocess_dataframe(df)
-
-    X, y, vectorizer = build_features(df)
-    X_train, X_test, y_train, y_test = split_data(X, y)
-
-    models = train_models(X_train, y_train)
-    results = evaluate_models(models, X_test, y_test)
-
-    best_name = max(results, key=lambda n: results[n]["f1"])
-    best_model = results[best_name]["model"]
-    print(f"\nBest model: {best_name} (F1={results[best_name]['f1']:.4f})")
-
-    joblib.dump(best_model, "models/spam_model.pkl")
-    joblib.dump(vectorizer, "models/vectorizer.pkl")
-    print("Saved model and vectorizer to models/")
+sample = "Congratulations! You have won a free prize. Click here to claim now!"
+print(f"\nSample prediction: '{sample}' -> {predict_message(sample)}")
 
 
-if __name__ == "__main__":
-    main()
+# ---------------------------------------------------------------------------
+# STEP 10: Save the Model
+# ---------------------------------------------------------------------------
+os.makedirs('models', exist_ok=True)
+
+with open('models/spam_model.pkl', 'wb') as f:
+    pickle.dump(model, f)
+
+with open('models/vectorizer.pkl', 'wb') as f:
+    pickle.dump(vectorizer, f)
+
+print("\nModel and vectorizer saved to models/")
